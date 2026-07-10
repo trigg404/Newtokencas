@@ -61,6 +61,13 @@ const CONFIG = {
   minBuySellRatio: parseFloat(process.env.MIN_BUY_SELL_RATIO || "3"),
   minHolderGrowthPct: parseFloat(process.env.MIN_HOLDER_GROWTH_PCT || "0.10"),
   maxWatchMinutes: parseFloat(process.env.MAX_WATCH_MINUTES || "45"),
+  // "creation" = earliest possible signal, extremely noisy (anyone can
+  // create a token in 10 seconds). "migration" = only alert once a token
+  // has graduated off the bonding curve (~$69k proven demand) — far fewer
+  // alerts, dramatically higher quality. "both" sends both event types,
+  // clearly labeled. Default is migration-only since that's what actually
+  // answers "how do I get fewer bad coins."
+  pumpfunAlertOn: process.env.PUMPFUN_ALERT_ON || "migration",
 };
 
 // GoPlus chain-id mapping for the EVM chains we support (Solana omitted —
@@ -195,6 +202,29 @@ async function checkTokenSafety(tokenAddress, chain) {
       isHoneypot: data.is_honeypot === "1",
       flags,
       holderCount: parseInt(data.holder_count || "0"),
+    };
+  } catch (e) {
+    return { checked: false, reason: e.message };
+  }
+}
+
+// ─── Solana safety check (RugCheck.xyz, free, no key needed) ────────────────
+async function checkSolanaTokenSafety(mintAddress) {
+  try {
+    const url = `https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report`;
+    const { status, body } = await httpGetJson(url);
+    if (status !== 200 || !body) return { checked: false, reason: `HTTP ${status}` };
+
+    const risks = body.risks || [];
+    const highRisks = risks.filter(r => r.level === "HIGH" || r.level === "CRITICAL" || r.level === "danger");
+    const score = body.score_normalised ?? body.score ?? 0;
+    const isDangerous = score >= 60 || highRisks.length >= 2;
+
+    return {
+      checked: true,
+      isDangerous,
+      score,
+      flags: risks.map(r => `${(r.level === "HIGH" || r.level === "CRITICAL" || r.level === "danger") ? "🚨" : "⚠️"} ${r.name}`),
     };
   } catch (e) {
     return { checked: false, reason: e.message };
@@ -363,6 +393,7 @@ async function scan() {
 // also the rawest, least-filtered layer of the entire memecoin pipeline.
 let pumpfunWs = null;
 let pumpfunReconnectDelay = 5000;
+const knownCreationTokens = new Map(); // mint -> { name, symbol, creator, createdAt } — for enriching migration alerts
 
 function connectPumpfun() {
   if (!WebSocket) {
@@ -375,13 +406,18 @@ function connectPumpfun() {
     ? `wss://pumpportal.fun/api/data?api-key=${CONFIG.pumpportalApiKey}`
     : `wss://pumpportal.fun/api/data`;
 
-  console.log("🔌 Connecting to pump.fun live feed...");
+  console.log(`🔌 Connecting to pump.fun live feed (mode: ${CONFIG.pumpfunAlertOn})...`);
   pumpfunWs = new WebSocket(url);
 
   pumpfunWs.on("open", () => {
-    console.log("🟢 pump.fun feed connected — subscribing to new token events");
+    console.log("🟢 pump.fun feed connected");
     pumpfunReconnectDelay = 5000; // reset backoff on successful connect
+    // Always track creations internally (even if not alerting on them) so
+    // migration alerts can be enriched with name/creator/age info.
     pumpfunWs.send(JSON.stringify({ method: "subscribeNewToken" }));
+    if (CONFIG.pumpfunAlertOn === "migration" || CONFIG.pumpfunAlertOn === "both") {
+      pumpfunWs.send(JSON.stringify({ method: "subscribeMigration" }));
+    }
   });
 
   pumpfunWs.on("message", async (raw) => {
@@ -404,32 +440,113 @@ function connectPumpfun() {
   });
 }
 
-async function handlePumpfunEvent(msg) {
-  // PumpPortal's new-token event includes fields like: mint, name, symbol,
-  // solAmount (initial buy), marketCapSol, uri, traderPublicKey (creator)
-  if (!msg.mint || !msg.name) return; // not a token-creation event
-
+async function alertPumpfunCreation(msg) {
   const initialBuySol = parseFloat(msg.solAmount || msg.initialBuy || "0");
-  if (initialBuySol < CONFIG.pumpfunMinInitialBuySol) return; // filter tiny/no-conviction launches
+  if (initialBuySol < CONFIG.pumpfunMinInitialBuySol) return;
 
-  console.log(`🆕 pump.fun: ${msg.name} ($${msg.symbol}) — initial buy ${initialBuySol} SOL`);
+  console.log(`🆕 pump.fun creation: ${msg.name} ($${msg.symbol}) — initial buy ${initialBuySol} SOL`);
 
-  const msgText =
+  const rugcheck = await checkSolanaTokenSafety(msg.mint);
+  let safetySection;
+  if (rugcheck.checked) {
+    if (rugcheck.isDangerous) {
+      await sendTelegram(
+        `🚫 *HIGH-RISK TOKEN BLOCKED* 🚫\n\n*${msg.name}* ($${msg.symbol}) — ` +
+        `RugCheck score ${rugcheck.score}/100.\n${rugcheck.flags.join("\n")}\n\n` +
+        `\`${msg.mint}\`\n\n_Skipped instead of alerted as an opportunity._`
+      );
+      return;
+    }
+    safetySection = rugcheck.flags.length
+      ? `*RugCheck:* score ${rugcheck.score}/100\n${rugcheck.flags.join("\n")}\n\n`
+      : `*RugCheck:* ✅ score ${rugcheck.score}/100, no major flags\n\n`;
+  } else {
+    safetySection = `*RugCheck:* unavailable (${rugcheck.reason}) — verify manually.\n\n`;
+  }
+
+  await sendTelegram(
     `🆕🎰 *NEW PUMP.FUN TOKEN* 🎰🆕\n\n` +
-    `*${msg.name}* ($${msg.symbol || "?"})\n` +
-    `\`${msg.mint}\`\n\n` +
+    `*${msg.name}* ($${msg.symbol || "?"})\n\`${msg.mint}\`\n\n` +
     `*Initial buy:* ${initialBuySol.toFixed(2)} SOL\n` +
     (msg.marketCapSol ? `*Market cap:* ${parseFloat(msg.marketCapSol).toFixed(1)} SOL\n` : "") +
     `*Creator:* \`${msg.traderPublicKey || "unknown"}\`\n\n` +
-    `⚠️ *This is the EARLIEST possible stage — pre-liquidity-pool, still on ` +
-    `the bonding curve. No safety check is automated for pump.fun tokens. ` +
-    `The overwhelming majority of pump.fun launches go to zero within hours. ` +
-    `Verify manually via RugCheck.xyz. This is a lottery ticket, not a trade.*`;
+    safetySection +
+    `⚠️ *EARLIEST possible stage — pre-liquidity-pool, unproven. The ` +
+    `overwhelming majority of pump.fun creations go to zero within hours, ` +
+    `even after passing RugCheck. This is a lottery ticket, not a trade.*`
+  );
+}
 
-  await sendTelegram(msgText);
+async function alertPumpfunMigration(msg) {
+  const mint = msg.mint || msg.tokenMint;
+  const known = knownCreationTokens.get(mint);
+  const name = known?.name || msg.name || "Unknown";
+  const symbol = known?.symbol || msg.symbol || "?";
+  const ageMin = known ? (Date.now() - known.createdAt) / 60000 : null;
+
+  console.log(`🎓 pump.fun MIGRATION: ${name} ($${symbol}) graduated to real trading pool`);
+
+  const rugcheck = await checkSolanaTokenSafety(mint);
+  let safetySection;
+  if (rugcheck.checked) {
+    if (rugcheck.isDangerous) {
+      await sendTelegram(
+        `🚫 *GRADUATED TOKEN — BUT HIGH RISK* 🚫\n\n*${name}* ($${symbol}) graduated, ` +
+        `but RugCheck score ${rugcheck.score}/100.\n${rugcheck.flags.join("\n")}\n\n\`${mint}\`\n\n` +
+        `_Graduation proves demand, not safety. Skipped as opportunity framing._`
+      );
+      return;
+    }
+    safetySection = rugcheck.flags.length
+      ? `*RugCheck:* score ${rugcheck.score}/100\n${rugcheck.flags.join("\n")}\n\n`
+      : `*RugCheck:* ✅ score ${rugcheck.score}/100, no major flags\n\n`;
+  } else {
+    safetySection = `*RugCheck:* unavailable (${rugcheck.reason}) — verify manually.\n\n`;
+  }
+
+  await sendTelegram(
+    `🎓🔥 *PUMP.FUN TOKEN GRADUATED* 🔥🎓\n\n` +
+    `*${name}* ($${symbol})\n\`${mint}\`\n\n` +
+    (ageMin != null ? `*Time to graduate:* ${ageMin < 60 ? Math.round(ageMin) + " min" : (ageMin / 60).toFixed(1) + "h"}\n` : "") +
+    `*Now trading on:* Raydium (real liquidity pool, no longer bonding curve)\n\n` +
+    safetySection +
+    `_Graduation requires ~$69k in real bonding-curve demand — a much stronger ` +
+    `signal than raw creation. Still not remotely safe by default: verify ` +
+    `liquidity lock and holder concentration yourself. Not financial advice._`
+  );
+}
+
+async function handlePumpfunEvent(msg) {
+  // Migration event (has a distinct shape — no solAmount initial-buy field,
+  // may include a pool/migration marker)
+  const isMigrationEvent = msg.txType === "migrate" || msg.method === "migration" || (msg.pool && !msg.solAmount);
+
+  if (isMigrationEvent) {
+    if (CONFIG.pumpfunAlertOn === "migration" || CONFIG.pumpfunAlertOn === "both") {
+      await alertPumpfunMigration(msg);
+    }
+    return;
+  }
+
+  // Creation event
+  if (!msg.mint || !msg.name) return; // not a token-creation event either
+
+  knownCreationTokens.set(msg.mint, {
+    name: msg.name, symbol: msg.symbol, creator: msg.traderPublicKey, createdAt: Date.now(),
+  });
+  // Bound memory — pump.fun creates thousands of tokens/day
+  if (knownCreationTokens.size > 50000) {
+    const firstKey = knownCreationTokens.keys().next().value;
+    knownCreationTokens.delete(firstKey);
+  }
+
+  if (CONFIG.pumpfunAlertOn === "creation" || CONFIG.pumpfunAlertOn === "both") {
+    await alertPumpfunCreation(msg);
+  }
 }
 
 async function testScan() {
+
   console.log("🧪 Test mode: running one real scan pass immediately...");
   await scan();
   console.log("✅ Test scan complete. If nothing alerted, no pool currently meets the filters — that's normal, not a bug.");
@@ -443,8 +560,9 @@ async function testScan() {
 console.log("═══════════════════════════════════════════════════");
 console.log("  New Token Volume Scanner — ⚠️  HIGH RISK ⚠️");
 console.log(`  Feed A (GeckoTerminal): ${CONFIG.chains.join(", ")} — every ${CONFIG.pollMs / 60000}min`);
-console.log(`  Feed B (pump.fun):      ${CONFIG.enablePumpfun ? (WebSocket ? "✅ live WebSocket" : "❌ 'ws' package missing") : "disabled"}`);
-console.log(`  Safety check (GoPlus):  ${Object.keys(GOPLUS_CHAIN_IDS).join(", ")} — Solana not automated`);
+console.log(`  Feed B (pump.fun):      ${CONFIG.enablePumpfun ? (WebSocket ? `✅ live WebSocket, mode: ${CONFIG.pumpfunAlertOn}` : "❌ 'ws' package missing") : "disabled"}`);
+console.log(`  Safety check (GoPlus):  ${Object.keys(GOPLUS_CHAIN_IDS).join(", ")}`);
+console.log(`  Safety check (RugCheck): pump.fun/Solana tokens — free, no key`);
 console.log(`  Min liquidity: $${CONFIG.minLiquidityUsd.toLocaleString()} | Max age: ${CONFIG.maxAgeHours}h | Min vol/liq: ${CONFIG.minVolLiqRatio}x | Min buy/sell: ${CONFIG.minBuySellRatio}:1`);
 console.log(`  Holder growth gate (EVM only): +${(CONFIG.minHolderGrowthPct * 100).toFixed(0)}% within ${CONFIG.maxWatchMinutes}min`);
 console.log("═══════════════════════════════════════════════════");

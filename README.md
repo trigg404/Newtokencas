@@ -74,3 +74,20 @@ even the ones that pass every filter.**
 
   Solana tokens (including all pump.fun ones) skip this gate and alert
   immediately, since holder-growth tracking isn't automated for Solana yet.
+
+## New: RugCheck safety check + migration-based alerting
+
+- **RugCheck.xyz integration (free, no key)** — every pump.fun alert now
+  gets an automated Solana safety check: risk score, mint/freeze authority
+  status, liquidity lock, holder concentration. Tokens RugCheck flags as
+  dangerous get blocked from alerting as an "opportunity" — same pattern
+  as the GoPlus honeypot block on EVM chains.
+
+- **PUMPFUN_ALERT_ON setting** — this is the real fix for "too many bad
+  coins." Default is now `migration`: instead of alerting on raw token
+  creation (the noisiest possible moment — anyone can create a pump.fun
+  token in 10 seconds), the bot waits until a token actually GRADUATES
+  off the bonding curve to a real Raydium pool, which requires roughly
+  $69k in genuine bonding-curve demand. Far fewer alerts, dramatically
+  higher quality. Set to `creation` for the old earliest-possible-signal
+  behavior, or `both` to get both event types clearly labeled.
