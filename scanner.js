@@ -58,6 +58,9 @@ const CONFIG = {
   enablePumpfun: process.env.ENABLE_PUMPFUN !== "false",
   pumpportalApiKey: process.env.PUMPPORTAL_API_KEY || "",
   pumpfunMinInitialBuySol: parseFloat(process.env.PUMPFUN_MIN_INITIAL_BUY_SOL || "1"),
+  minBuySellRatio: parseFloat(process.env.MIN_BUY_SELL_RATIO || "3"),
+  minHolderGrowthPct: parseFloat(process.env.MIN_HOLDER_GROWTH_PCT || "0.10"),
+  maxWatchMinutes: parseFloat(process.env.MAX_WATCH_MINUTES || "45"),
 };
 
 // GoPlus chain-id mapping for the EVM chains we support (Solana omitted —
@@ -148,15 +151,17 @@ function evaluatePool(pool, chain) {
   const priceChange24h = parseFloat(a.price_change_percentage?.h24 || "0");
   const buys1h = a.transactions?.h1?.buys || 0;
   const sells1h = a.transactions?.h1?.sells || 0;
+  const buySellRatio = buys1h / Math.max(sells1h, 1);
 
   const passes = liquidity >= CONFIG.minLiquidityUsd
     && ageHours <= CONFIG.maxAgeHours
-    && ratio >= CONFIG.minVolLiqRatio;
+    && ratio >= CONFIG.minVolLiqRatio
+    && buySellRatio >= CONFIG.minBuySellRatio;
 
   return {
     passes, chain, name: a.name, address: a.address,
     liquidity, volume24h, volume1h, ageHours, ratio, fdv,
-    priceChange1h, priceChange24h, buys1h, sells1h,
+    priceChange1h, priceChange24h, buys1h, sells1h, buySellRatio,
     poolId: pool.id,
   };
 }
@@ -198,6 +203,7 @@ async function checkTokenSafety(tokenAddress, chain) {
 
 // ─── Alert ────────────────────────────────────────────────────────────────────
 const seenPools = new Set();
+const watchlist = new Map(); // poolId -> { pool, safety, firstHolderCount, watchStartedAt, lastRatio }
 
 function riskFlags(p) {
   const flags = [];
@@ -208,38 +214,25 @@ function riskFlags(p) {
   return flags;
 }
 
-async function alertPool(p) {
+function buildAlertMessage(p, safety, holderGrowthPct) {
   const flags = riskFlags(p);
   const chainLabel = CHAIN_LABELS[p.chain] || p.chain;
 
-  // Run the contract safety check for EVM chains; skip silently for Solana
-  const safety = await checkTokenSafety(p.address, p.chain);
-
-  // If GoPlus flagged an actual honeypot, don't even send the "opportunity"
-  // framing — send a distinct warning instead, since this isn't a real signal.
-  if (safety.checked && safety.isHoneypot) {
-    await sendTelegram(
-      `🚫 *HONEYPOT BLOCKED — NOT ALERTING AS OPPORTUNITY* 🚫\n\n` +
-      `*${p.name}* on ${chainLabel} matched the volume filters, but GoPlus ` +
-      `Security confirmed this contract blocks selling.\n\n` +
-      `\`${p.address}\`\n\n` +
-      `_This is why the safety check exists. Skipped._`
-    );
-    return;
-  }
-
   let safetySection;
   if (safety.checked) {
+    const growthLine = holderGrowthPct != null
+      ? `📈 Holder count grew +${(holderGrowthPct * 100).toFixed(0)}% since first seen\n`
+      : "";
     safetySection = safety.flags.length
-      ? `*Contract Safety (GoPlus):*\n${safety.flags.join("\n")}\n\n`
-      : `*Contract Safety (GoPlus):* ✅ No red flags detected (${safety.holderCount.toLocaleString()} holders)\n\n`;
+      ? `*Contract Safety (GoPlus):*\n${safety.flags.join("\n")}\n${growthLine}\n`
+      : `*Contract Safety (GoPlus):* ✅ No red flags detected (${safety.holderCount.toLocaleString()} holders)\n${growthLine}\n`;
   } else if (p.chain === "solana") {
     safetySection = `*Contract Safety:* Not automated for Solana yet — verify manually via RugCheck.xyz before considering.\n\n`;
   } else {
     safetySection = `*Contract Safety:* Check unavailable (${safety.reason}) — verify manually.\n\n`;
   }
 
-  const msg =
+  return (
     `🆕🔥 *NEW TOKEN VOLUME SPIKE* 🔥🆕\n\n` +
     `*${p.name}* on ${chainLabel}\n` +
     `\`${p.address}\`\n\n` +
@@ -249,22 +242,86 @@ async function alertPool(p) {
     `*1h Volume:* $${p.volume1h.toLocaleString("en-US", { maximumFractionDigits: 0 })}\n` +
     `*FDV:* $${p.fdv.toLocaleString("en-US", { maximumFractionDigits: 0 })}\n` +
     `*Price:* ${p.priceChange1h >= 0 ? "+" : ""}${p.priceChange1h.toFixed(1)}% (1h) / ${p.priceChange24h >= 0 ? "+" : ""}${p.priceChange24h.toFixed(1)}% (24h)\n` +
-    `*1h Buys/Sells:* ${p.buys1h} / ${p.sells1h}\n\n` +
+    `*1h Buys/Sells:* ${p.buys1h} / ${p.sells1h}  _(${p.buySellRatio.toFixed(1)}:1 ratio)_\n\n` +
     (flags.length ? `${flags.join("\n")}\n\n` : "") +
     safetySection +
     `⚠️ *The large majority of brand-new tokens are rug pulls, honeypots, or ` +
     `abandoned within hours. These filters reduce noise and catch SOME scams, ` +
     `not all. Verify liquidity lock and holder concentration yourself before ` +
     `ever considering this. Not financial advice — this is closer to a lottery ` +
-    `ticket than a trade.*`;
+    `ticket than a trade.*`
+  );
+}
 
-  await sendTelegram(msg);
+async function handleQualifyingPool(p) {
+  const safety = await checkTokenSafety(p.address, p.chain);
+
+  if (safety.checked && safety.isHoneypot) {
+    await sendTelegram(
+      `🚫 *HONEYPOT BLOCKED — NOT ALERTING AS OPPORTUNITY* 🚫\n\n` +
+      `*${p.name}* on ${CHAIN_LABELS[p.chain] || p.chain} matched the volume filters, ` +
+      `but GoPlus Security confirmed this contract blocks selling.\n\n` +
+      `\`${p.address}\`\n\n_This is why the safety check exists. Skipped._`
+    );
+    return;
+  }
+
+  // Solana (or anywhere GoPlus can't check) — can't measure holder growth,
+  // so alert immediately on the volume/ratio signal alone.
+  if (!safety.checked) {
+    await sendTelegram(buildAlertMessage(p, safety, null));
+    return;
+  }
+
+  // EVM with a successful safety check — hold for holder-growth confirmation
+  // instead of alerting on a single snapshot.
+  watchlist.set(p.poolId, {
+    pool: p, safety, firstHolderCount: safety.holderCount,
+    watchStartedAt: Date.now(),
+  });
+  console.log(`   👀 Watching ${p.name} for holder growth (baseline: ${safety.holderCount} holders)`);
+}
+
+async function processWatchlist() {
+  if (watchlist.size === 0) return;
+  console.log(`\n👀 Re-checking ${watchlist.size} watched token(s) for holder growth...`);
+
+  for (const [poolId, entry] of [...watchlist.entries()]) {
+    const fresh = await checkTokenSafety(entry.pool.address, entry.pool.chain);
+    await new Promise(r => setTimeout(r, 200));
+
+    if (fresh.checked && fresh.isHoneypot) {
+      watchlist.delete(poolId);
+      await sendTelegram(
+        `🚫 *HONEYPOT DETECTED DURING WATCH PERIOD* 🚫\n\n` +
+        `*${entry.pool.name}* went honeypot after initial check — good thing we waited.\n` +
+        `\`${entry.pool.address}\``
+      );
+      continue;
+    }
+    if (!fresh.checked) continue; // transient API issue, try again next cycle
+
+    const elapsedMin = (Date.now() - entry.watchStartedAt) / 60000;
+    const growthPct = entry.firstHolderCount > 0
+      ? (fresh.holderCount - entry.firstHolderCount) / entry.firstHolderCount
+      : 0;
+
+    if (growthPct >= CONFIG.minHolderGrowthPct) {
+      watchlist.delete(poolId);
+      await sendTelegram(buildAlertMessage(entry.pool, fresh, growthPct));
+      console.log(`   ✅ ${entry.pool.name}: holder growth confirmed (+${(growthPct * 100).toFixed(0)}%), alerted`);
+    } else if (elapsedMin > CONFIG.maxWatchMinutes) {
+      watchlist.delete(poolId);
+      console.log(`   ⌛ ${entry.pool.name}: watch expired without confirmed growth, dropped`);
+    }
+    // else: keep watching, check again next cycle
+  }
 }
 
 async function scan() {
   console.log(`\n🔍 Scanning for new pools... ${new Date().toISOString()}`);
   let totalChecked = 0;
-  let totalAlerted = 0;
+  let totalQualified = 0;
 
   for (const chain of CONFIG.chains) {
     const pools = await fetchNewPools(chain);
@@ -277,16 +334,18 @@ async function scan() {
 
       const evaluated = evaluatePool(pool, chain);
       if (evaluated.passes) {
-        console.log(`   🆕 ${evaluated.name}: liquidity $${evaluated.liquidity.toFixed(0)}, vol/liq ${evaluated.ratio.toFixed(1)}x, age ${evaluated.ageHours.toFixed(1)}h`);
-        await alertPool(evaluated);
-        totalAlerted++;
-        await new Promise(r => setTimeout(r, 500)); // don't burst Telegram
+        console.log(`   🆕 ${evaluated.name}: liquidity $${evaluated.liquidity.toFixed(0)}, vol/liq ${evaluated.ratio.toFixed(1)}x, buy/sell ${evaluated.buySellRatio.toFixed(1)}:1, age ${evaluated.ageHours.toFixed(1)}h`);
+        await handleQualifyingPool(evaluated);
+        totalQualified++;
+        await new Promise(r => setTimeout(r, 500)); // don't burst Telegram/GoPlus
       }
     }
     await new Promise(r => setTimeout(r, 300)); // be polite between chains
   }
 
-  console.log(`   Checked ${totalChecked} pools total, ${totalAlerted} alert(s) sent`);
+  console.log(`   Checked ${totalChecked} pools total, ${totalQualified} qualified (watchlist size: ${watchlist.size})`);
+
+  await processWatchlist();
 
   // Trim memory
   if (seenPools.size > 20000) {
@@ -374,6 +433,10 @@ async function testScan() {
   console.log("🧪 Test mode: running one real scan pass immediately...");
   await scan();
   console.log("✅ Test scan complete. If nothing alerted, no pool currently meets the filters — that's normal, not a bug.");
+  console.log(`   Note: EVM tokens that qualify go to a holder-growth watchlist (not an`);
+  console.log(`   immediate alert) — they'll alert on a LATER scan cycle once growth is`);
+  console.log(`   confirmed, or get dropped after ${CONFIG.maxWatchMinutes} min if it never shows up.`);
+  console.log(`   Current watchlist size: ${watchlist.size}`);
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
@@ -382,7 +445,8 @@ console.log("  New Token Volume Scanner — ⚠️  HIGH RISK ⚠️");
 console.log(`  Feed A (GeckoTerminal): ${CONFIG.chains.join(", ")} — every ${CONFIG.pollMs / 60000}min`);
 console.log(`  Feed B (pump.fun):      ${CONFIG.enablePumpfun ? (WebSocket ? "✅ live WebSocket" : "❌ 'ws' package missing") : "disabled"}`);
 console.log(`  Safety check (GoPlus):  ${Object.keys(GOPLUS_CHAIN_IDS).join(", ")} — Solana not automated`);
-console.log(`  Min liquidity: $${CONFIG.minLiquidityUsd.toLocaleString()} | Max age: ${CONFIG.maxAgeHours}h | Min vol/liq: ${CONFIG.minVolLiqRatio}x`);
+console.log(`  Min liquidity: $${CONFIG.minLiquidityUsd.toLocaleString()} | Max age: ${CONFIG.maxAgeHours}h | Min vol/liq: ${CONFIG.minVolLiqRatio}x | Min buy/sell: ${CONFIG.minBuySellRatio}:1`);
+console.log(`  Holder growth gate (EVM only): +${(CONFIG.minHolderGrowthPct * 100).toFixed(0)}% within ${CONFIG.maxWatchMinutes}min`);
 console.log("═══════════════════════════════════════════════════");
 console.log("  Deployed separately from your other scanners on");
 console.log("  purpose — use a different bot/chat to keep this");

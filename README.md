@@ -57,3 +57,20 @@ which connects automatically on normal startup — check the logs for
 
 **Treat every alert from this bot as a lottery ticket, not a trade —
 even the ones that pass every filter.**
+
+## New: buy pressure + holder growth confirmation
+
+- **MIN_BUY_SELL_RATIO** (default 3) — requires 1h buys to outnumber sells
+  by at least this ratio. Filters out pools with volume but no real buy pressure.
+
+- **Holder growth watchlist (EVM only)** — instead of alerting on a single
+  snapshot, EVM tokens that pass the other filters go onto a watchlist.
+  On each subsequent scan (every POLL_MINUTES), holder count is re-checked
+  via GoPlus. Only alerts once holder count has grown by MIN_HOLDER_GROWTH_PCT
+  (default 10%) — actual evidence of increasing interest, not just a
+  point-in-time guess. Tokens that don't show growth within MAX_WATCH_MINUTES
+  (default 45) are dropped silently. If a watched token turns out to be a
+  honeypot before growth confirms, you get warned about that instead.
+
+  Solana tokens (including all pump.fun ones) skip this gate and alert
+  immediately, since holder-growth tracking isn't automated for Solana yet.
