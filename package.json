@@ -1,0 +1,11 @@
+{
+  "name": "new-token-scanner",
+  "version": "1.0.0",
+  "description": "HIGH RISK — new token volume + pump.fun scanner with GoPlus safety checks, deployed separately by design",
+  "main": "scanner.js",
+  "scripts": { "start": "node scanner.js" },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
